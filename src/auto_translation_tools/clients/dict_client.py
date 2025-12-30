@@ -6,7 +6,17 @@
 
 import os
 import httpx
+from dataclasses import dataclass
 from typing import Optional
+
+
+@dataclass
+class LookupResult:
+    """词典查询结果"""
+    translation: str      # 译名
+    source: str           # 来源词典名称
+    database_id: str      # 词典ID
+    raw_definition: str   # 原始定义（包含HTML）
 
 
 class DictClient:
@@ -56,15 +66,15 @@ class DictClient:
         
         self._client = httpx.Client(timeout=self.timeout, headers=headers)
     
-    def lookup(self, word: str, database: str = "*") -> Optional[str]:
-        """查询词条
+    def lookup(self, word: str, database: str = "*") -> Optional[LookupResult]:
+        """查询词条，返回完整结果
         
         Args:
             word: 要查询的词
-            database: 词典名称 (person, place, *, etc.)
+            database: 词典名称 (person, place, ec_dict, *, etc.)
             
         Returns:
-            译名，未找到返回 None
+            LookupResult 包含译名和来源，未找到返回 None
         """
         try:
             response = self._client.post(
@@ -75,44 +85,42 @@ class DictClient:
             result = response.json()
             
             if result.get("found") and result.get("definitions"):
-                # 返回第一个定义
-                return result["definitions"][0].get("definition", "")
+                first_def = result["definitions"][0]
+                return LookupResult(
+                    translation=first_def.get("definition", ""),
+                    source=first_def.get("database_name", first_def.get("database", database)),
+                    database_id=first_def.get("database", database),
+                    raw_definition=first_def.get("definition", "")
+                )
             return None
             
         except httpx.HTTPError as e:
             raise ConnectionError(f"Dict Reader request failed: {e}")
     
-    def lookup_person(self, name: str) -> Optional[str]:
-        """查询人名
-        
-        Args:
-            name: 人名
-            
-        Returns:
-            中文译名，未找到返回 None
-        """
+    def lookup_person(self, name: str) -> Optional[LookupResult]:
+        """查询人名（世界人名翻译大辞典）"""
         return self.lookup(name, "person")
     
-    def lookup_place(self, name: str) -> Optional[str]:
-        """查询地名
-        
-        Args:
-            name: 地名
-            
-        Returns:
-            中文译名，未找到返回 None
-        """
+    def lookup_place(self, name: str) -> Optional[LookupResult]:
+        """查询地名（世界地名翻译大辞典）"""
         return self.lookup(name, "place")
     
-    def lookup_by_entity_type(self, name: str, entity_type: str) -> Optional[str]:
-        """根据实体类型查询
+    def lookup_general(self, word: str) -> Optional[LookupResult]:
+        """查询通用词典（英汉大词典）
+        
+        用于专项词典未找到时的备选查询
+        """
+        return self.lookup(word, "ec_dict")
+    
+    def lookup_by_entity_type(self, name: str, entity_type: str) -> Optional[LookupResult]:
+        """根据实体类型查询专项词典
         
         Args:
             name: 名称
             entity_type: NER 实体类型 (PERSON, LOCATION, etc.)
             
         Returns:
-            中文译名，未找到返回 None
+            LookupResult，未找到返回 None
         """
         database = self.ENTITY_TO_DICT.get(entity_type, "*")
         return self.lookup(name, database)

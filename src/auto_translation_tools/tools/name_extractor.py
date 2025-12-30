@@ -57,6 +57,11 @@ class NameExtractor(BaseTool):
     ) -> TranslationResult:
         """提取并翻译专有名词
         
+        查询优先级:
+        1. 专项词典（世界人名/地名翻译大辞典）
+        2. 通用词典（英汉大词典）
+        3. 人名姓氏回退查询
+        
         Args:
             text: 要处理的文本
             language: 语言代码 ("en" 或 "es")
@@ -78,16 +83,16 @@ class NameExtractor(BaseTool):
                 seen.add(key)
                 unique_entities.append(entity)
         
-        # 3. 查询词典
+        # 3. 多级查询词典
         for entity in unique_entities:
-            translation = self._lookup_with_fallback(entity.text, entity.type)
+            lookup_result = self._lookup_with_priority(entity.text, entity.type)
             
-            if translation:
+            if lookup_result:
                 result.found.append({
                     "text": entity.text,
                     "type": entity.type,
-                    "translation": translation,
-                    "source": "词典"
+                    "translation": lookup_result["translation"],
+                    "source": lookup_result["source"]
                 })
             else:
                 result.not_found.append({
@@ -97,26 +102,51 @@ class NameExtractor(BaseTool):
         
         return result
     
-    def _lookup_with_fallback(self, text: str, entity_type: str) -> str | None:
-        """查询词典，支持回退策略
+    def _lookup_with_priority(self, text: str, entity_type: str) -> dict | None:
+        """多级优先级查询
         
-        对于人名：先查全名，找不到则查姓氏
+        优先级:
+        1. 专项词典（人名翻译大辞典/地名翻译大辞典）
+        2. 通用词典（英汉大词典）
+        3. 人名姓氏回退
+        
+        Returns:
+            {"translation": str, "source": str} 或 None
         """
-        # 标准化实体类型（CITY -> LOCATION 等）
         normalized_type = self._normalize_entity_type(entity_type)
         
-        # 直接查询
-        translation = self.dict_client.lookup_by_entity_type(text, normalized_type)
-        if translation:
-            return self._clean_translation(translation)
+        # 第一优先级：专项词典
+        lookup_result = self.dict_client.lookup_by_entity_type(text, normalized_type)
+        if lookup_result:
+            translation = self._clean_translation(lookup_result.raw_definition)
+            if translation:  # 只有有效译名才返回
+                return {
+                    "translation": translation,
+                    "source": lookup_result.source
+                }
         
-        # 人名回退：尝试查询姓氏（假设最后一个词是姓）
+        # 第二优先级：通用词典（英汉大词典）
+        lookup_result = self.dict_client.lookup_general(text)
+        if lookup_result:
+            translation = self._clean_translation(lookup_result.raw_definition)
+            if translation:  # 只有有效译名才返回
+                return {
+                    "translation": translation,
+                    "source": lookup_result.source
+                }
+        
+        # 第三优先级：人名姓氏回退
         if normalized_type == "PERSON" and " " in text:
             parts = text.split()
             last_name = parts[-1]  # 姓氏通常在最后
-            translation = self.dict_client.lookup_person(last_name)
-            if translation:
-                return self._clean_translation(translation)
+            lookup_result = self.dict_client.lookup_person(last_name)
+            if lookup_result:
+                translation = self._clean_translation(lookup_result.raw_definition)
+                if translation:
+                    return {
+                        "translation": translation,
+                        "source": f"{lookup_result.source}（姓氏）"
+                    }
         
         return None
     
@@ -128,13 +158,17 @@ class NameExtractor(BaseTool):
             return "LOCATION"
         return entity_type
     
-    def _clean_translation(self, raw_html: str) -> str:
+    def _clean_translation(self, raw_html: str) -> str | None:
         """清理词典返回的 HTML 格式译名
         
-        词典返回可能包含 HTML 标签，需要提取纯文本译名
+        词典返回可能包含 HTML 标签和导航元素，需要提取纯文本译名
         格式示例：
-        - 人名：Smith斯米特[法、英]；史密斯[英]
-        - 地名：Paris 【国家】法 【译名】巴黎
+        - 人名词典：Smith斯米特[法、英]；史密斯[英]
+        - 地名词典：Paris 【国家】法 【译名】巴黎
+        - 英汉大词典：回到顶部HonshuHon·shuˈhɒnʃuː本州(岛)...
+        
+        Returns:
+            清理后的译名，如果是无效内容返回 None
         """
         import re
         
@@ -142,32 +176,37 @@ class NameExtractor(BaseTool):
         text = re.sub(r'<[^>]+>', '', raw_html)
         text = text.strip()
         
-        # 尝试提取【译名】后的内容（地名格式）
+        # 移除开头的导航噪音文本
+        noise_patterns = [
+            r'^回到顶部',
+            r'^返回顶部',
+            r'^查看更多',
+        ]
+        for pattern in noise_patterns:
+            text = re.sub(pattern, '', text)
+        text = text.strip()
+        
+        # 尝试提取【译名】后的内容（地名词典格式）
         if '【译名】' in text:
             match = re.search(r'【译名】\s*(\S+)', text)
             if match:
                 return match.group(1).strip()
         
-        # 尝试提取中文译名（人名格式：Name译名[语言]）
-        # 匹配连续的中文字符
-        chinese_match = re.search(r'[\u4e00-\u9fff·]+', text)
+        # 尝试提取带括号的中文译名（英汉大词典格式：本州(岛)）
+        # 匹配：连续中文字符 + 可选的括号内容
+        chinese_with_paren = re.search(r'([\u4e00-\u9fff·]+(?:\([^)]+\))?)', text)
+        if chinese_with_paren:
+            translation = chinese_with_paren.group(1)
+            # 过滤掉过短或无意义的结果
+            if len(translation) >= 2:
+                return translation
+        
+        # 回退：提取连续的中文字符
+        chinese_match = re.search(r'[\u4e00-\u9fff·]{2,}', text)
         if chinese_match:
-            translation = chinese_match.group()
-            # 移除可能的前缀英文
-            return translation
+            return chinese_match.group()
         
-        # 回退：返回清理后的第一行
-        lines = text.split('\n')
-        if lines:
-            first_line = lines[0].strip()
-            # 取第一个分号前的内容
-            for sep in ['；', ';', '，', ',']:
-                if sep in first_line:
-                    first_line = first_line.split(sep)[0].strip()
-                    break
-            return first_line
-        
-        return text
+        return None
     
     def run(self, input_data: dict) -> dict:
         """BaseTool 接口实现
